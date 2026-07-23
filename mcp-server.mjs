@@ -611,22 +611,24 @@ wss.on("connection", (ws) => {
 // Start
 // ════════════════════════════════════════
 
-// Kill any existing process on PORT
-try {
-  const pid = execSync(`lsof -ti:${PORT} 2>/dev/null`).toString().trim();
-  if (pid) {
-    process.stderr.write(`voice-call: killing existing process on :${PORT} (pid ${pid})\n`);
-    execSync(`kill ${pid} 2>/dev/null`);
-    execSync("sleep 1");
+httpServer.on("error", (err) => {
+  if (err.code === "EADDRINUSE") {
+    process.stderr.write(`voice-call: port ${PORT} already in use, refusing to start\n`);
+    process.exit(1);
   }
-} catch {}
+  process.stderr.write(`voice-call: server error: ${err.message}\n`);
+  process.exit(1);
+});
 
 httpServer.listen(PORT, HOST, () => {
   process.stderr.write(`voice-call: MCP + HTTP server on ${HOST}:${PORT}\n`);
 });
 
 // Shutdown
+let shuttingDown = false;
 function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
   process.stderr.write("voice-call: shutting down\n");
   for (const [, p] of pendingVoice) clearTimeout(p.timer);
   pendingVoice.clear();
