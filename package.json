@@ -1,0 +1,26 @@
+{
+  "name": "voice-nook-src",
+  "version": "1.0.0",
+  "description": "给你的 AI 装上耳朵和嘴 —— 在 Telegram 小程序里和你的 Claude Code 伙伴打电话。",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zzyyksl/voice-nook.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/zzyyksl/voice-nook/issues"
+  },
+  "homepage": "https://github.com/zzyyksl/voice-nook#readme",
+  "dependencies": {
+    "ws": "^8.21.1"
+  }
+}
