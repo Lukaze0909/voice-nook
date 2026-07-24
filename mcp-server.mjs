@@ -501,15 +501,16 @@ httpServer.on("upgrade", (req, socket, head) => {
     const initData = url.searchParams.get("initData") || "";
     const user = checkInitData(initData);
     if (!user) {
-      socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
-      socket.destroy();
+      socket.write("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+      socket.end();
       return;
     }
     wss.handleUpgrade(req, socket, head, ws => {
       wss.emit("connection", ws, req);
     });
   } else {
-    socket.destroy();
+    socket.write("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    socket.end();
   }
 });
 
