@@ -156,29 +156,54 @@ function addMsg(cls, text, pending) {
 }
 
 // ── shared audio player: one voice at a time, tap again to stop ──
+const PlaybackEndReason = Object.freeze({
+  NATURAL: 'natural',     // onended 自然触发
+  USER_STOP: 'user_stop', // 用户点击"停止播放"（同一按钮切换）
+  ERROR: 'error',         // audio.onerror
+  REJECTED: 'rejected',   // player.play() 的 promise 被 reject
+  FORCED: 'forced',       // 被 stopContinuousMode/handleForcedStop/替换 拆除——未指定原因时的默认值
+});
 let player = null, playerBtn = null, livePlayerActive = false;
-function stopPlayer(){
+function stopPlayer(reason = PlaybackEndReason.FORCED){
+  if (!player) return; // 幂等
   const wasLive = livePlayerActive;
-  if (player) { try { player.pause(); } catch {} }
+  const audio = player;
+  audio.onended = null;
+  audio.onerror = null; // 先摘掉旧Audio的事件引用，再pause，避免任何遗留回调
+  try { audio.pause(); } catch {}
   if (playerBtn) playerBtn.textContent = playerBtn.dataset.label;
   player = null; playerBtn = null; livePlayerActive = false;
-  if (wasLive && continuousActive) stopContinuousMode();
+  if (wasLive) onLivePlaybackEnded(reason);
+}
+function onLivePlaybackEnded(reason) {
+  if (!continuousActive) return; // stopContinuousMode已经跑过了（它先置continuousActive=false再调用stopPlayer，不会递归）
+  if (reason === PlaybackEndReason.NATURAL) beginResuming();
+  else stopContinuousMode();
 }
 function playToggle(src, el, opts){
+  // 第1步：无论本次opts是否带live，只要点的是当前正在播的同一个按钮，就是"停止播放"，必须优先处理。
+  if (player && playerBtn === el) { stopPlayer(PlaybackEndReason.USER_STOP); return; }
+  // 第2步：确定不是在停止当前播放器之后，才判断是否要拒绝一次新的非-live播放。
   const live = !!(opts && opts.live);
-  if (player && playerBtn === el) { stopPlayer(); return; }
+  if (!live && continuousActive) return; // 连续模式期间拒绝任何新的非-live播放（历史/会话重听），避免被麦克风录回
+  // 第3步：替换掉前一个仍在播的其他音频（如果有）。
   stopPlayer();
-  player = new Audio(src); playerBtn = el; livePlayerActive = live;
+  if (live && !continuousActive) return; // 上面这次FORCED拆除如果刚好把整场通话结束了，禁止继续创建/播放这个新的live Audio
+  // 第4步：创建新播放器，回调绑定本次实例。
+  const audio = new Audio(src);
+  player = audio; playerBtn = el; livePlayerActive = live;
   el.textContent = '停止播放';
   let done = false;
-  const onDone = () => {
+  const finish = (reason) => {
     if (done) return;
     done = true;
-    if (playerBtn === el) stopPlayer();
+    // 陈旧Audio的回调不得停止新播放器或触发续听：必须同时核对player与playerBtn，
+    // 因为历史/manual重听按钮会被反复点击，同一个el可能先后对应不同Audio实例。
+    if (player === audio && playerBtn === el) stopPlayer(reason);
   };
-  player.onended = onDone;
-  player.onerror = onDone;
-  player.play().catch(onDone);
+  audio.onended = () => finish(PlaybackEndReason.NATURAL);
+  audio.onerror = () => finish(PlaybackEndReason.ERROR);
+  audio.play().catch(() => finish(PlaybackEndReason.REJECTED));
 }
 function replayBtn(src, label){
   const p = document.createElement('span'); p.className = 'replay';
@@ -276,7 +301,7 @@ let lastSendTs = 0;
 // ── 单一显式状态机（手动/连续两条流程共用，只表达"正在发生什么"，不表达"归属谁"）──
 const CallState = Object.freeze({
   IDLE: 'IDLE', LISTENING: 'LISTENING', RECORDING: 'RECORDING',
-  WAITING_REPLY: 'WAITING_REPLY', PLAYING: 'PLAYING', ENDED: 'ENDED',
+  WAITING_REPLY: 'WAITING_REPLY', PLAYING: 'PLAYING', RESUMING: 'RESUMING', ENDED: 'ENDED',
 });
 let callState = CallState.IDLE;
 
@@ -298,6 +323,8 @@ let reconnectTimer = null;
 let continuousStream = null, audioCtx = null, analyser = null, analyserBuf = null, vadTimer = null;
 let calibrating = false, calibrationTimer = null, calibrationCancel = null;
 let armTimeoutTimer = null; // 等待开口超时：只在校准完成、armForListening成功后才会被设置
+let resumeCooldownTimer = null; // 播放自然结束后的回声冷却：单实例、可取消，stopContinuousMode统一清理
+const RESUME_COOLDOWN_MS = 300; // 250-400ms建议区间取中值
 let noiseFloor = 0, onsetStreak = 0, silenceStartTs = 0, recordStartTs = 0;
 
 // ── 手动流程专用：处理 getUserMedia 异步竞态 ──
@@ -373,6 +400,7 @@ function updateContinuousUI() {
     [CallState.RECORDING]: '正在录音...',
     [CallState.WAITING_REPLY]: '处理中...',
     [CallState.PLAYING]: '播放中...',
+    [CallState.RESUMING]: '准备继续听...',
   };
   if (!continuousActive) {
     continuousBtn.textContent = '开始通话';
@@ -761,6 +789,7 @@ function vadTick() {
 // ── 提前arm录音器：只允许在校准/收尾等"确认处于LISTENING"的位置调用 ──
 function armForListening() {
   if (!continuousActive || callState !== CallState.LISTENING) return false;
+  if (requestSlotBusy) return false; // 上一轮请求尚未完全释放，绝不允许re-arm
   if (!continuousStream) return false;
   const track = continuousStream.getAudioTracks()[0];
   if (!track || track.readyState !== 'live') return false;
@@ -782,6 +811,40 @@ function onArmTimeout() {
   if (!continuousActive || callState !== CallState.LISTENING) return; // 已确认开口或已结束，本次超时失效
   stopContinuousMode(); // 内部先置空handler+清chunks再stop，armed录音被丢弃，不会走发送路径
   status.textContent = '未检测到说话，通话已结束';
+}
+
+// ── Phase 3：播放自然结束后的续听链路。只处理"完整播放过一段live TTS并自然播完"的场景，
+// 不得被 returnToListeningOrEnd（discard/空chunks/send失败）调用，二者互不相交。 ──
+function beginResuming() {
+  if (!continuousActive) return;
+  callState = CallState.RESUMING;
+  updateContinuousUI(); // 显示冷却文案；VAD已在结构上被排除（vadTick守卫只允许LISTENING/RECORDING）
+  if (resumeCooldownTimer) { clearTimeout(resumeCooldownTimer); resumeCooldownTimer = null; }
+  resumeCooldownTimer = setTimeout(finishResuming, RESUME_COOLDOWN_MS);
+}
+
+function finishResuming() {
+  resumeCooldownTimer = null;
+  if (!continuousActive || callState !== CallState.RESUMING) return; // 冷却期间被打断
+  if (audioCtx && audioCtx.state !== 'running') {
+    audioCtx.resume().then(() => {
+      if (!continuousActive || callState !== CallState.RESUMING) return;
+      tryArmAndListen();
+    }).catch(() => {
+      if (!continuousActive || callState !== CallState.RESUMING) return;
+      stopContinuousMode();
+      status.textContent = '音频恢复失败，通话已结束';
+    });
+    return;
+  }
+  tryArmAndListen();
+}
+
+function tryArmAndListen() {
+  callState = CallState.LISTENING; // armForListening自身的守卫要求这个
+  const armed = armForListening();
+  if (!armed) { stopContinuousMode(); status.textContent = '录音初始化失败，请重试'; return; }
+  updateContinuousUI(); // 先arm成功，再显示"正在听（连续）"——与Phase 2.1同一套顺序原则
 }
 
 async function startContinuousMode() {
@@ -849,6 +912,7 @@ function stopContinuousMode() {
   if (calibrationTimer) { clearTimeout(calibrationTimer); calibrationTimer = null; }
   if (calibrationCancel) { const c = calibrationCancel; calibrationCancel = null; c(); }
   if (armTimeoutTimer) { clearTimeout(armTimeoutTimer); armTimeoutTimer = null; }
+  if (resumeCooldownTimer) { clearTimeout(resumeCooldownTimer); resumeCooldownTimer = null; }
   if (vadTimer) { clearInterval(vadTimer); vadTimer = null; }
   calibrating = false;
   if (mediaRec && mediaRec.state === 'recording') {
