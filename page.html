@@ -31,6 +31,9 @@ h1 small{color:var(--hint);font-weight:400;font-size:12px;margin-left:8px}
 @keyframes pulse{0%,100%{box-shadow:0 6px 30px rgba(215,127,161,.5)}50%{box-shadow:0 6px 40px rgba(232,93,117,.7)}}
 .call-btn.processing{background:var(--hint);animation:none}
 .call-btn.disabled{background:#ccc;pointer-events:none}
+.mode-btn{display:block;margin:10px auto 0;background:none;border:1px solid var(--acc);color:var(--acc);border-radius:20px;padding:8px 22px;font-size:13px}
+.mode-btn.active{background:var(--acc);color:#fff}
+.mode-btn.disabled{opacity:.5;pointer-events:none}
 .ws-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;vertical-align:middle}
 .ws-dot.on{background:#4caf50}
 .ws-dot.off{background:#f44336}
@@ -76,6 +79,7 @@ h1 small{color:var(--hint);font-weight:400;font-size:12px;margin-left:8px}
   <div class="call-wrap">
     <div class="call-status" id="callStatus"><span class="ws-dot off" id="wsDot"></span>连接中...</div>
     <button class="call-btn disabled" id="callBtn">按住说话</button>
+    <button class="mode-btn disabled" id="continuousBtn">开始通话</button>
   </div>
   <div class="subtabs">
     <div class="subtab active" data-sub="session">本次通话</div>
@@ -152,19 +156,29 @@ function addMsg(cls, text, pending) {
 }
 
 // ── shared audio player: one voice at a time, tap again to stop ──
-let player = null, playerBtn = null;
+let player = null, playerBtn = null, livePlayerActive = false;
 function stopPlayer(){
+  const wasLive = livePlayerActive;
   if (player) { try { player.pause(); } catch {} }
   if (playerBtn) playerBtn.textContent = playerBtn.dataset.label;
-  player = null; playerBtn = null;
+  player = null; playerBtn = null; livePlayerActive = false;
+  if (wasLive && continuousActive) stopContinuousMode();
 }
-function playToggle(src, el){
+function playToggle(src, el, opts){
+  const live = !!(opts && opts.live);
   if (player && playerBtn === el) { stopPlayer(); return; }
   stopPlayer();
-  player = new Audio(src); playerBtn = el;
+  player = new Audio(src); playerBtn = el; livePlayerActive = live;
   el.textContent = '停止播放';
-  player.onended = player.onerror = () => { if (playerBtn === el) stopPlayer(); };
-  player.play().catch(() => { if (playerBtn === el) stopPlayer(); });
+  let done = false;
+  const onDone = () => {
+    if (done) return;
+    done = true;
+    if (playerBtn === el) stopPlayer();
+  };
+  player.onended = onDone;
+  player.onerror = onDone;
+  player.play().catch(onDone);
 }
 function replayBtn(src, label){
   const p = document.createElement('span'); p.className = 'replay';
@@ -252,42 +266,180 @@ document.getElementById('histLoad').onclick = fetchCalls;
 
 // ── voice call (WebSocket) ──
 const btn = document.getElementById('callBtn');
+const continuousBtn = document.getElementById('continuousBtn');
 const status = document.getElementById('callStatus');
 const wsDot = document.getElementById('wsDot');
 let wsConn = null;
-let mediaRec, chunks, stream;
-let isProcessing = false;
+let mediaRec, chunks;
 let lastSendTs = 0;
 
+// ── 单一显式状态机（手动/连续两条流程共用，只表达"正在发生什么"，不表达"归属谁"）──
+const CallState = Object.freeze({
+  IDLE: 'IDLE', LISTENING: 'LISTENING', RECORDING: 'RECORDING',
+  WAITING_REPLY: 'WAITING_REPLY', PLAYING: 'PLAYING', ENDED: 'ENDED',
+});
+let callState = CallState.IDLE;
+
+// ── 归属显式标记：禁止从 callState 反推是哪条流程 ──
+let continuousActive = false; // 连续会话是否存在：开始通话点击时立即置true，stopContinuousMode里置false
+let manualBusy = false;       // 手动流程是否占用中（含申请麦克风阶段），resetBtn/丢弃分支/cancelManualRecording里置false
+let activeRequest = null;     // { owner: 'manual'|'continuous', cancelled, gen }：WAITING_REPLY期间在途请求的身份标记
+
+// ── 全局单飞门：结构上保证客户端任意时刻最多一个在途请求，取消只加tombstone不放行 ──
+let requestSlotBusy = false;  // 音频真正发送成功后置true；仅在"正常回复/错误到达"或"超时"或"WS close"时释放
+let requestGen = 0;           // 每次真正发送时自增，作为该请求的唯一代号
+let requestTimeoutTimer = null;
+const CLIENT_REQUEST_TIMEOUT_MS = 125000; // 需略大于服务端120秒超时
+
+// ── 重连定时器：单实例、可取消，避免旧socket的重连链与新连接并发 ──
+let reconnectTimer = null;
+
+// ── 连续模式专用资源：所有权只归 continuousStream，只由 stopContinuousMode 统一关闭 ──
+let continuousStream = null, audioCtx = null, analyser = null, analyserBuf = null, vadTimer = null;
+let calibrating = false, calibrationTimer = null, calibrationCancel = null;
+let armTimeoutTimer = null; // 等待开口超时：只在校准完成、armForListening成功后才会被设置
+let noiseFloor = 0, onsetStreak = 0, silenceStartTs = 0, recordStartTs = 0;
+
+// ── 手动流程专用：处理 getUserMedia 异步竞态 ──
+let manualAcquireSeq = 0;
+let currentManualStream = null;
+
+// ── VAD 常量 ──
+const VAD_INTERVAL_MS = 50;
+const CALIBRATION_MS = 300;
+const ONSET_FRAMES = 2;
+const ONSET_MULTIPLIER = 2.0;
+const CONTINUE_MULTIPLIER = 1.7;
+const SILENCE_MS = 800;
+const MIN_RECORD_MS = 350;
+const MAX_RECORD_MS = 25000;
+const MIN_NOISE_FLOOR = 6; // 绝对阈值下限，避免安静环境 noiseFloor→0 导致抖动误触发
+const ARM_TIMEOUT_MS = 30000; // 等待开口的上限：超时仍未确认开口则安全结束本轮，不自动重试
+
+function refreshManualBtnDisabled() {
+  btn.classList.toggle('disabled', continuousActive || manualBusy || requestSlotBusy || !wsConn || wsConn.readyState !== 1);
+}
+function refreshContinuousBtnDisabled() {
+  const disable = !continuousActive && (manualBusy || requestSlotBusy || !wsConn || wsConn.readyState !== 1);
+  continuousBtn.classList.toggle('disabled', disable);
+}
+
+function clearRequestSlot() {
+  if (requestTimeoutTimer) { clearTimeout(requestTimeoutTimer); requestTimeoutTimer = null; }
+  activeRequest = null;
+  requestSlotBusy = false;
+}
+
+// ── 占位气泡统一收尾：timeout/cancel/close 共用同一方式，避免各处重复实现遗漏 ──
+function finalizePendingBubble(text) {
+  if (!pendingBubble) return null;
+  const b = pendingBubble;
+  b.textContent = text;
+  b.classList.remove('pending');
+  pendingBubble = null;
+  return b;
+}
+
+function onRequestTimeout(gen) {
+  requestTimeoutTimer = null;
+  if (!activeRequest || activeRequest.gen !== gen) return; // 已被新一轮/其他回调处理，本次失效
+  const req = activeRequest;
+  activeRequest = null;
+  requestSlotBusy = false;
+  // 全局单飞门保证此刻的 pendingBubble（如果还在）必然属于这个超时的请求本身，可以安全收尾
+  finalizePendingBubble(req.cancelled ? '（已取消：超时未回复）' : '（超时未回复）');
+  if (!req.cancelled) {
+    // 真实超时（未取消）：把对应流程收回IDLE，避免卡死
+    if (req.owner === 'continuous') stopContinuousMode();
+    else resetBtn();
+  }
+  refreshManualBtnDisabled();
+  refreshContinuousBtnDisabled();
+}
+
 function resetBtn() {
-  isProcessing = false;
+  manualBusy = false;
+  callState = CallState.IDLE;
   btn.textContent = '按住说话';
   btn.classList.remove('processing');
   status.innerHTML = '<span class="ws-dot on"></span>按住说话';
+  refreshManualBtnDisabled();
+  refreshContinuousBtnDisabled();
+}
+
+function updateContinuousUI() {
+  const map = {
+    [CallState.LISTENING]: calibrating ? '校准中...' : '正在听（连续）...',
+    [CallState.RECORDING]: '正在录音...',
+    [CallState.WAITING_REPLY]: '处理中...',
+    [CallState.PLAYING]: '播放中...',
+  };
+  if (!continuousActive) {
+    continuousBtn.textContent = '开始通话';
+    continuousBtn.classList.remove('active');
+  } else {
+    continuousBtn.textContent = '结束通话';
+    continuousBtn.classList.add('active');
+    if (map[callState]) status.innerHTML = '<span class="ws-dot on"></span>' + map[callState];
+  }
+  refreshManualBtnDisabled();
+  refreshContinuousBtnDisabled();
+}
+
+function writeBubbleOnly(msg) {
+  // 迟到、已取消请求的回复/错误：只写入历史，不自动播放，不改变 callState/continuousActive/manualBusy 等任何状态。
+  // 全局单飞门保证此刻的 pendingBubble（如果还在）必然属于这个被取消的请求本身，可以安全消费/标记，不会误占用新一轮。
+  if (msg.type === 'error') {
+    const b = finalizePendingBubble('（已取消：' + msg.text + '）');
+    if (!b) addMsg('ai', '（' + msg.text + '）', true);
+    return;
+  }
+  let b = finalizePendingBubble(msg.text);
+  if (!b) b = addMsg('ai', msg.text);
+  if (msg.audio) b.appendChild(replayBtn('data:audio/mp3;base64,' + msg.audio, '重听这句'));
+  if (msg.zh) b.appendChild(zhToggle(msg.zh));
+}
+
+function scheduleReconnect() {
+  if (reconnectTimer) return; // 已有一个重连排队中，不重复排队（单实例）
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connectWS();
+  }, 3000);
 }
 
 function connectWS() {
   if (wsConn && wsConn.readyState <= 1) return;
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; } // 主动连接时取消排队中的重连
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  wsConn = new WebSocket(proto + '//' + location.host + '/ws/voice?initData=' + encodeURIComponent(initData));
+  const socket = new WebSocket(proto + '//' + location.host + '/ws/voice?initData=' + encodeURIComponent(initData));
+  wsConn = socket;
 
-  wsConn.onopen = () => {
+  socket.onopen = () => {
+    if (socket !== wsConn) return; // stale socket 的事件，wsConn 已指向更新的连接
     wsDot.className = 'ws-dot on';
     status.innerHTML = '<span class="ws-dot on"></span>按住说话';
-    btn.classList.remove('disabled');
     btn.textContent = '按住说话';
+    refreshManualBtnDisabled();
+    refreshContinuousBtnDisabled();
   };
 
-  wsConn.onclose = () => {
+  socket.onclose = () => {
+    if (socket !== wsConn) return; // stale socket：不得影响当前连接/在途请求/占位气泡，直接忽略
     wsDot.className = 'ws-dot off';
-    status.innerHTML = '<span class="ws-dot off"></span>断开了，重连中...';
-    btn.classList.add('disabled');
-    setTimeout(connectWS, 3000);
+    handleForcedStop();
+    clearRequestSlot(); // 仅在确认是当前连接时才释放：任何在途请求都不可能再收到回复
+    finalizePendingBubble('（连接已断开）'); // 连接已断，超时表也被清了，不收尾会永久停在"……"
+    status.innerHTML = '<span class="ws-dot off"></span>断开了，重连中...'; // 放在 handleForcedStop 之后，确保不被其内部的状态文案覆盖
+    refreshManualBtnDisabled();
+    refreshContinuousBtnDisabled();
+    scheduleReconnect();
   };
 
-  wsConn.onerror = () => {};
+  socket.onerror = () => {};
 
-  wsConn.onmessage = (e) => {
+  socket.onmessage = (e) => {
+    if (socket !== wsConn) return; // stale socket 的消息，直接丢弃
     try {
       const msg = JSON.parse(e.data);
       if (msg.type === 'status') {
@@ -295,62 +447,223 @@ function connectWS() {
       } else if (msg.type === 'transcript') {
         addMsg('me', msg.text);
         pendingBubble = addMsg('ai', '……', true);
-      } else if (msg.type === 'reply') {
-        let b;
-        if (pendingBubble) { b = pendingBubble; b.textContent = msg.text; b.classList.remove('pending'); pendingBubble = null; }
-        else b = addMsg('ai', msg.text);
-        if (msg.audio) {
-          const src = 'data:audio/mp3;base64,' + msg.audio;
-          const p = replayBtn(src, '重听这句');
-          b.appendChild(p);
-          playToggle(src, p);
+      } else if (msg.type === 'reply' || msg.type === 'error') {
+        const req = activeRequest;
+        clearRequestSlot(); // 正常/迟到回复都在此刻真正释放单飞门（超时清理见 onRequestTimeout）
+        if (!req) { refreshManualBtnDisabled(); refreshContinuousBtnDisabled(); return; } // 防御：理论不应发生
+        if (req.cancelled) {
+          writeBubbleOnly(msg);
+          refreshManualBtnDisabled();
+          refreshContinuousBtnDisabled();
+          return;
         }
-        if (msg.zh) b.appendChild(zhToggle(msg.zh));
-        resetBtn();
-      } else if (msg.type === 'error') {
-        if (pendingBubble) { pendingBubble.textContent = '（' + msg.text + '）'; pendingBubble = null; }
-        else addMsg('ai', '（' + msg.text + '）', true);
-        resetBtn();
+        const owner = req.owner;
+        if (msg.type === 'reply') {
+          let b;
+          if (pendingBubble) { b = pendingBubble; b.textContent = msg.text; b.classList.remove('pending'); pendingBubble = null; }
+          else b = addMsg('ai', msg.text);
+          if (msg.audio) {
+            const src = 'data:audio/mp3;base64,' + msg.audio;
+            const p = replayBtn(src, '重听这句');
+            b.appendChild(p);
+            if (msg.zh) b.appendChild(zhToggle(msg.zh));
+            if (owner === 'continuous') {
+              callState = CallState.PLAYING;
+              updateContinuousUI();
+              playToggle(src, p, { live: true });
+            } else {
+              resetBtn();
+              playToggle(src, p);
+            }
+          } else {
+            if (msg.zh) b.appendChild(zhToggle(msg.zh));
+            if (owner === 'continuous') stopContinuousMode();
+            else resetBtn();
+          }
+        } else { // error
+          if (pendingBubble) { pendingBubble.textContent = '（' + msg.text + '）'; pendingBubble = null; }
+          else addMsg('ai', '（' + msg.text + '）', true);
+          if (owner === 'continuous') stopContinuousMode();
+          else resetBtn();
+        }
       }
     } catch {}
   };
 }
 
-async function startRec() {
-  if (isProcessing || !wsConn || wsConn.readyState !== 1) return;
-  if (mediaRec && mediaRec.state === 'recording') return;
-  try {
-    stream = await navigator.mediaDevices.getUserMedia({ audio: { sampleRate: 16000, channelCount: 1 } });
-  } catch(e) { status.textContent = '需要麦克风权限'; return; }
+// ── mic 获取与 recorder 启动分离，供手动/连续两条流程复用 ──
+function acquireMicStream() {
+  return navigator.mediaDevices.getUserMedia({
+    audio: { sampleRate: 16000, channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+  });
+}
+
+function startRecorderWithStream(streamArg, owner) {
   chunks = [];
   const mimeType = MediaRecorder.isTypeSupported('audio/ogg;codecs=opus') ? 'audio/ogg;codecs=opus' : 'audio/webm;codecs=opus';
-  mediaRec = new MediaRecorder(stream, { mimeType });
-  mediaRec.ondataavailable = e => { if(e.data.size) chunks.push(e.data); };
-  mediaRec.onstop = () => {
-    stream.getTracks().forEach(t => t.stop());
-    if (chunks.length === 0) return;
-    if (Date.now() - lastSendTs < 1500) return;
-    lastSendTs = Date.now();
-    isProcessing = true;
+  const rec = new MediaRecorder(streamArg, { mimeType });
+  mediaRec = rec;
+  rec.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+  rec.onstop = () => onRecorderStop(rec, streamArg, owner, mimeType);
+  rec.start();
+}
+
+// ── continuous 专用：discard/空chunks/send失败 三处收尾统一走这里，
+// 保证"回到LISTENING"必须先成功re-arm，绝不留下没有recorder的VAD在跑 ──
+function returnToListeningOrEnd() {
+  if (!continuousActive) return;
+  callState = CallState.LISTENING;
+  const armed = armForListening();
+  if (!armed) {
+    stopContinuousMode();
+    status.textContent = '录音初始化失败，请重试';
+    return;
+  }
+  updateContinuousUI();
+}
+
+function onRecorderStop(recInstance, streamArg, owner, mimeType) {
+  if (recInstance !== mediaRec) return; // 陈旧回调：mediaRec 已指向更新的recorder实例，直接丢弃，防止误判归属新一轮
+  if (owner === 'manual') {
+    streamArg.getTracks().forEach(t => t.stop());
+    if (currentManualStream === streamArg) currentManualStream = null;
+  }
+  // continuous: streamArg 是 continuousStream，这里不关闭，统一归 stopContinuousMode 管理
+  if (chunks.length === 0 || Date.now() - lastSendTs < 1500) {
+    if (owner === 'continuous') {
+      onsetStreak = 0;
+      returnToListeningOrEnd();
+    } else {
+      manualBusy = false;
+      callState = CallState.IDLE;
+      refreshManualBtnDisabled();
+      refreshContinuousBtnDisabled();
+    }
+    return;
+  }
+  lastSendTs = Date.now();
+  callState = CallState.WAITING_REPLY;
+  if (owner === 'manual') {
     btn.textContent = '处理中';
     btn.classList.remove('recording');
     btn.classList.add('processing');
-    status.innerHTML = '<span class="ws-dot on"></span>发送中...';
-    const blob = new Blob(chunks, { type: mimeType });
-    blob.arrayBuffer().then(buf => {
-      if (wsConn && wsConn.readyState === 1) {
-        wsConn.send(buf);
+    refreshManualBtnDisabled();
+  } else {
+    updateContinuousUI();
+  }
+  status.innerHTML = '<span class="ws-dot on"></span>发送中...';
+  const blob = new Blob(chunks, { type: mimeType });
+  blob.arrayBuffer().then(buf => {
+    const sendSocket = wsConn; // 绑定发送时刻的连接身份，避免向已被替换的全局连接引用发送
+    const sendFailed = () => {
+      // 未能真正发送（连接未就绪，或 send 同步抛错）：各自收回，避免卡死在 WAITING_REPLY
+      if (owner === 'continuous') returnToListeningOrEnd();
+      else resetBtn();
+    };
+    if (sendSocket && sendSocket.readyState === 1) {
+      // 音频真正发送成功的这一刻才占用单飞门 + 分配generation + 起超时表
+      const myGen = ++requestGen;
+      activeRequest = { owner, cancelled: false, gen: myGen };
+      requestSlotBusy = true;
+      if (requestTimeoutTimer) { clearTimeout(requestTimeoutTimer); requestTimeoutTimer = null; } // 防御性清理（正常流程下此时应已为null）
+      requestTimeoutTimer = setTimeout(() => onRequestTimeout(myGen), CLIENT_REQUEST_TIMEOUT_MS);
+      refreshManualBtnDisabled();
+      refreshContinuousBtnDisabled();
+      try {
+        sendSocket.send(buf);
+      } catch (err) {
+        // send 同步抛错：撤销本次generation的全部分配，不得误清理另一个generation
+        if (requestTimeoutTimer) { clearTimeout(requestTimeoutTimer); requestTimeoutTimer = null; }
+        if (activeRequest && activeRequest.gen === myGen) activeRequest = null;
+        requestSlotBusy = false;
+        refreshManualBtnDisabled();
+        refreshContinuousBtnDisabled();
+        sendFailed();
       }
-    });
-  };
-  mediaRec.start();
+    } else {
+      sendFailed();
+    }
+  });
+}
+
+// ── 手动按住说话（原有交互，行为保持不变；显式处理 getUserMedia 异步竞态）──
+async function startRec() {
+  if (callState !== CallState.IDLE || continuousActive || manualBusy || requestSlotBusy) return;
+  if (mediaRec && mediaRec.state === 'recording') return;
+  const mySeq = ++manualAcquireSeq;
+  manualBusy = true;
+  refreshManualBtnDisabled();
+  refreshContinuousBtnDisabled();
+  let manualStream;
+  try {
+    manualStream = await acquireMicStream();
+  } catch (e) {
+    if (mySeq === manualAcquireSeq) manualBusy = false;
+    refreshManualBtnDisabled();
+    refreshContinuousBtnDisabled();
+    status.textContent = '需要麦克风权限';
+    return;
+  }
+  if (mySeq !== manualAcquireSeq || !manualBusy) {
+    // 权限完成前已经被 touchend/touchcancel/visibilitychange/WS断开 取消
+    manualStream.getTracks().forEach(t => t.stop());
+    return;
+  }
+  currentManualStream = manualStream;
+  callState = CallState.RECORDING;
+  refreshManualBtnDisabled();
+  refreshContinuousBtnDisabled();
+  startRecorderWithStream(manualStream, 'manual');
   btn.textContent = '松开发送';
   btn.classList.add('recording');
   status.innerHTML = '<span class="ws-dot on"></span>正在听...';
 }
 
 function stopRec() {
-  if (mediaRec && mediaRec.state === 'recording') mediaRec.stop();
+  if (manualBusy && mediaRec && mediaRec.state === 'recording') { mediaRec.stop(); return; }
+  if (manualBusy) {
+    // 仍在申请麦克风权限阶段就松手：记录取消，等 acquireMicStream 完成后自行关闭
+    manualAcquireSeq++;
+    manualBusy = false;
+    refreshManualBtnDisabled();
+    refreshContinuousBtnDisabled();
+  }
+}
+
+function cancelManualRecording() {
+  if (!manualBusy && !(mediaRec && mediaRec.state === 'recording' && !continuousActive)) return;
+  if (activeRequest && activeRequest.owner === 'manual' && !activeRequest.cancelled) {
+    // 与 stopContinuousMode 对 continuous 的处理一致：只打 tombstone，不提前释放 requestSlotBusy
+    activeRequest.cancelled = true;
+  }
+  manualAcquireSeq++;
+  manualBusy = false;
+  if (mediaRec && mediaRec.state === 'recording') {
+    mediaRec.ondataavailable = null;
+    mediaRec.onstop = null;
+    mediaRec.stop();
+  }
+  if (currentManualStream) {
+    currentManualStream.getTracks().forEach(t => t.stop());
+    currentManualStream = null;
+  }
+  chunks = [];
+  callState = CallState.IDLE;
+  btn.textContent = '按住说话';
+  btn.classList.remove('recording', 'processing');
+  refreshManualBtnDisabled();
+  refreshContinuousBtnDisabled();
+}
+
+function handleForcedStop() {
+  // 顺序很重要：
+  // 1) 先停播放器——覆盖 manual 回复/历史重听（非live）的场景；若当前是 continuous 的 live 回放，
+  //    stopPlayer 内部会因 continuousActive 仍为 true 而级联触发 stopContinuousMode（幂等，不会失控递归）。
+  // 2) 再显式结束连续模式，覆盖 LISTENING/RECORDING/WAITING_REPLY 等非播放状态（此时若上一步已经结束过，这里是空操作）。
+  // 3) 最后处理手动收尾，避免 cancelManualRecording 误把连续模式正在用的 mediaRec 当成手动的。
+  stopPlayer();
+  if (continuousActive) stopContinuousMode();
+  cancelManualRecording();
 }
 
 btn.addEventListener('touchstart', e => { e.preventDefault(); startRec(); });
@@ -358,7 +671,227 @@ btn.addEventListener('touchend', e => { e.preventDefault(); stopRec(); });
 btn.addEventListener('touchcancel', e => { e.preventDefault(); stopRec(); });
 btn.addEventListener('mousedown', e => { e.preventDefault(); startRec(); });
 btn.addEventListener('mouseup', e => { e.preventDefault(); stopRec(); });
-btn.addEventListener('mouseleave', e => { if(mediaRec?.state==='recording') stopRec(); });
+btn.addEventListener('mouseleave', e => { stopRec(); });
+
+// ── 连续对话模式（Phase 2：单轮，不自动续听，不支持打断）──
+function readAnalyserRMS() {
+  if (!analyser || !analyserBuf) return 0;
+  analyser.getByteTimeDomainData(analyserBuf);
+  let sumSq = 0;
+  for (let i = 0; i < analyserBuf.length; i++) {
+    const dev = analyserBuf[i] - 128;
+    sumSq += dev * dev;
+  }
+  return Math.sqrt(sumSq / analyserBuf.length);
+}
+
+function calibrateNoiseFloor() {
+  return new Promise(resolve => {
+    const samples = [];
+    const start = Date.now();
+    calibrationCancel = () => resolve(null);
+    const tick = () => {
+      if (!continuousActive || !analyser || !audioCtx) { calibrationCancel = null; resolve(null); return; }
+      samples.push(readAnalyserRMS());
+      if (Date.now() - start < CALIBRATION_MS) {
+        calibrationTimer = setTimeout(tick, VAD_INTERVAL_MS);
+      } else {
+        calibrationCancel = null;
+        const avg = samples.reduce((a, b) => a + b, 0) / samples.length;
+        resolve(Math.max(avg, MIN_NOISE_FLOOR));
+      }
+    };
+    tick();
+  });
+}
+
+function discardRecording() {
+  if (mediaRec) {
+    mediaRec.ondataavailable = null;
+    mediaRec.onstop = null;
+    if (mediaRec.state === 'recording') mediaRec.stop();
+  }
+  chunks = [];
+  onsetStreak = 0;
+  returnToListeningOrEnd(); // 先完整停掉旧recorder并清空旧handlers/chunks，再回LISTENING并re-arm；re-arm失败则安全结束本轮
+}
+
+function vadTick() {
+  if (!continuousActive || !analyser || !audioCtx) return;
+  if (calibrating) return;
+  if (callState !== CallState.LISTENING && callState !== CallState.RECORDING) return;
+  if (audioCtx.state === 'suspended') { stopContinuousMode(); return; }
+  const rms = readAnalyserRMS();
+
+  if (callState === CallState.LISTENING) {
+    if (rms > noiseFloor * ONSET_MULTIPLIER) {
+      onsetStreak++;
+      if (onsetStreak >= ONSET_FRAMES) {
+        onsetStreak = 0;
+        callState = CallState.RECORDING;
+        recordStartTs = Date.now();
+        silenceStartTs = 0;
+        if (armTimeoutTimer) { clearTimeout(armTimeoutTimer); armTimeoutTimer = null; } // 已确认开口，不再需要"等待开口"超时
+        updateContinuousUI();
+        // 不再创建/启动新的 MediaRecorder：LISTENING 阶段已经armed的同一个recorder继续录，避免首音节裁切
+      }
+    } else {
+      onsetStreak = 0;
+    }
+    return;
+  }
+
+  // callState === RECORDING
+  const elapsed = Date.now() - recordStartTs;
+  if (rms > noiseFloor * CONTINUE_MULTIPLIER) {
+    silenceStartTs = 0;
+  } else {
+    if (!silenceStartTs) silenceStartTs = Date.now();
+    if (Date.now() - silenceStartTs >= SILENCE_MS) {
+      if (elapsed < MIN_RECORD_MS) discardRecording();
+      else if (mediaRec && mediaRec.state === 'recording') mediaRec.stop();
+      return;
+    }
+  }
+  if (elapsed >= MAX_RECORD_MS && mediaRec && mediaRec.state === 'recording') {
+    mediaRec.stop();
+  }
+}
+
+// ── 提前arm录音器：只允许在校准/收尾等"确认处于LISTENING"的位置调用 ──
+function armForListening() {
+  if (!continuousActive || callState !== CallState.LISTENING) return false;
+  if (!continuousStream) return false;
+  const track = continuousStream.getAudioTracks()[0];
+  if (!track || track.readyState !== 'live') return false;
+  if (mediaRec && mediaRec.state === 'recording') return false; // 已有recorder在跑，禁止重复arm
+  if (armTimeoutTimer) { clearTimeout(armTimeoutTimer); armTimeoutTimer = null; } // 先清旧timer，再建新的，禁止重复timer
+  try {
+    startRecorderWithStream(continuousStream, 'continuous');
+  } catch (e) {
+    mediaRec = null;
+    chunks = [];
+    return false;
+  }
+  armTimeoutTimer = setTimeout(onArmTimeout, ARM_TIMEOUT_MS);
+  return true;
+}
+
+function onArmTimeout() {
+  armTimeoutTimer = null; // 先清引用
+  if (!continuousActive || callState !== CallState.LISTENING) return; // 已确认开口或已结束，本次超时失效
+  stopContinuousMode(); // 内部先置空handler+清chunks再stop，armed录音被丢弃，不会走发送路径
+  status.textContent = '未检测到说话，通话已结束';
+}
+
+async function startContinuousMode() {
+  if (continuousActive || manualBusy || requestSlotBusy || callState !== CallState.IDLE || !wsConn || wsConn.readyState !== 1) return;
+  continuousActive = true; // await getUserMedia 前立即置位
+  callState = CallState.LISTENING;
+  calibrating = true;
+  updateContinuousUI();
+  let s;
+  try {
+    s = await acquireMicStream();
+  } catch (e) {
+    continuousActive = false;
+    callState = CallState.IDLE;
+    calibrating = false;
+    updateContinuousUI();
+    status.textContent = '需要麦克风权限';
+    return;
+  }
+  if (!continuousActive) { s.getTracks().forEach(t => t.stop()); return; } // 权限完成前已被结束通话/断线打断
+  continuousStream = s;
+  continuousStream.getAudioTracks().forEach(t => {
+    t.onended = () => {
+      if (!continuousActive) return; // 主动结束通话时 continuousActive 已先置为false，这里直接短路，不会把正常stop()误报成麦克风故障
+      stopContinuousMode();
+      status.textContent = '麦克风连接已断开，通话已结束';
+    };
+  });
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (audioCtx.state !== 'running') {
+    try { await audioCtx.resume(); } catch (e) {}
+  }
+  if (!continuousActive) return; // resume 等待期间已被 stopContinuousMode 完整清理，这里无需重复处理
+  if (audioCtx.state !== 'running') {
+    stopContinuousMode();
+    status.textContent = '音频初始化失败，请重试';
+    return;
+  }
+  const srcNode = audioCtx.createMediaStreamSource(continuousStream);
+  analyser = audioCtx.createAnalyser();
+  analyser.fftSize = 512;
+  analyserBuf = new Uint8Array(analyser.fftSize);
+  srcNode.connect(analyser);
+
+  noiseFloor = await calibrateNoiseFloor();
+  if (!continuousActive || noiseFloor === null) return; // 校准期间已被打断（结束通话/断线）
+
+  calibrating = false;
+  onsetStreak = 0;
+  // 严格顺序：先arm（此时 continuousActive/callState===LISTENING/track live 均已满足）→ 确认成功 → 显示"正在听" → 启动vadTimer。
+  // 用户看到"正在听"时，recorder必须已经处于recording状态。
+  const armed = armForListening();
+  if (!armed) {
+    stopContinuousMode();
+    status.textContent = '录音初始化失败，请重试';
+    return;
+  }
+  updateContinuousUI();
+  vadTimer = setInterval(vadTick, VAD_INTERVAL_MS);
+}
+
+function stopContinuousMode() {
+  if (!continuousActive) return; // 幂等，避免重复触发/重复清理
+  continuousActive = false;
+  if (calibrationTimer) { clearTimeout(calibrationTimer); calibrationTimer = null; }
+  if (calibrationCancel) { const c = calibrationCancel; calibrationCancel = null; c(); }
+  if (armTimeoutTimer) { clearTimeout(armTimeoutTimer); armTimeoutTimer = null; }
+  if (vadTimer) { clearInterval(vadTimer); vadTimer = null; }
+  calibrating = false;
+  if (mediaRec && mediaRec.state === 'recording') {
+    // 不再限定 callState===RECORDING：LISTENING阶段已armed的录音器同样要丢弃，且必须先置空handler、清空chunks，再stop，
+    // 确保结束通话/hidden/WS close/arm超时都不会把已积累的音频当成"发送成功"的一轮送出去。
+    mediaRec.ondataavailable = null;
+    mediaRec.onstop = null;
+    chunks = [];
+    mediaRec.stop();
+  }
+  if (continuousStream) {
+    continuousStream.getTracks().forEach(t => { t.onended = null; t.stop(); }); // 先摘掉onended再stop，避免主动结束被误报成麦克风故障
+    continuousStream = null;
+  }
+  if (audioCtx) { audioCtx.close().catch(() => {}); audioCtx = null; }
+  analyser = null; analyserBuf = null;
+  onsetStreak = 0; silenceStartTs = 0;
+  if (activeRequest && activeRequest.owner === 'continuous' && !activeRequest.cancelled) {
+    activeRequest.cancelled = true;
+  }
+  stopPlayer(); // 若本轮live回复仍在播放，一并停止；非live或未在播时内部安全空转
+  callState = CallState.ENDED;
+  status.innerHTML = '<span class="ws-dot on"></span>已结束';
+  continuousBtn.textContent = '开始通话';
+  continuousBtn.classList.remove('active');
+  refreshManualBtnDisabled();
+  refreshContinuousBtnDisabled();
+  setTimeout(() => {
+    callState = CallState.IDLE;
+    if (wsConn && wsConn.readyState === 1) status.innerHTML = '<span class="ws-dot on"></span>按住说话';
+    refreshManualBtnDisabled();
+    refreshContinuousBtnDisabled();
+  }, 600);
+}
+
+continuousBtn.addEventListener('click', () => {
+  if (continuousActive) stopContinuousMode();
+  else startContinuousMode();
+});
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') handleForcedStop();
+});
 
 // Auto-connect when switching to call tab
 connectWS();
