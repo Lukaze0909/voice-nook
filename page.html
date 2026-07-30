@@ -326,6 +326,9 @@ let armTimeoutTimer = null; // 等待开口超时：只在校准完成、armForL
 let resumeCooldownTimer = null; // 播放自然结束后的回声冷却：单实例、可取消，stopContinuousMode统一清理
 const RESUME_COOLDOWN_MS = 300; // 250-400ms建议区间取中值
 let noiseFloor = 0, onsetStreak = 0, silenceStartTs = 0, recordStartTs = 0;
+let continuousAsrEmptyCount = 0; // 连续模式内"没听清"连续次数，成功识别/新通话开始或结束时清零
+const MAX_CONSECUTIVE_ASR_EMPTY = 2; // 最多允许2次重新监听；第3次连续空结果时结束通话
+const ASR_EMPTY_TEXT = '没听清，再说一次'; // 须与 mcp-server.mjs:559 逐字节一致
 
 // ── 手动流程专用：处理 getUserMedia 异步竞态 ──
 let manualAcquireSeq = 0;
@@ -475,6 +478,7 @@ function connectWS() {
       } else if (msg.type === 'transcript') {
         addMsg('me', msg.text);
         pendingBubble = addMsg('ai', '……', true);
+        if (activeRequest && activeRequest.owner === 'continuous') continuousAsrEmptyCount = 0;
       } else if (msg.type === 'reply' || msg.type === 'error') {
         const req = activeRequest;
         clearRequestSlot(); // 正常/迟到回复都在此刻真正释放单飞门（超时清理见 onRequestTimeout）
@@ -511,8 +515,20 @@ function connectWS() {
         } else { // error
           if (pendingBubble) { pendingBubble.textContent = '（' + msg.text + '）'; pendingBubble = null; }
           else addMsg('ai', '（' + msg.text + '）', true);
-          if (owner === 'continuous') stopContinuousMode();
-          else resetBtn();
+          if (owner === 'continuous') {
+            if (msg.text === ASR_EMPTY_TEXT) {
+              continuousAsrEmptyCount += 1;
+              if (continuousAsrEmptyCount <= MAX_CONSECUTIVE_ASR_EMPTY) {
+                returnToListeningOrEnd();
+              } else {
+                stopContinuousMode();
+              }
+            } else {
+              stopContinuousMode();
+            }
+          } else {
+            resetBtn();
+          }
         }
       }
     } catch {}
@@ -850,6 +866,7 @@ function tryArmAndListen() {
 async function startContinuousMode() {
   if (continuousActive || manualBusy || requestSlotBusy || callState !== CallState.IDLE || !wsConn || wsConn.readyState !== 1) return;
   continuousActive = true; // await getUserMedia 前立即置位
+  continuousAsrEmptyCount = 0;
   callState = CallState.LISTENING;
   calibrating = true;
   updateContinuousUI();
@@ -930,6 +947,7 @@ function stopContinuousMode() {
   if (audioCtx) { audioCtx.close().catch(() => {}); audioCtx = null; }
   analyser = null; analyserBuf = null;
   onsetStreak = 0; silenceStartTs = 0;
+  continuousAsrEmptyCount = 0;
   if (activeRequest && activeRequest.owner === 'continuous' && !activeRequest.cancelled) {
     activeRequest.cancelled = true;
   }
